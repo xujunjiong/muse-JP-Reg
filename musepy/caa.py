@@ -15,18 +15,20 @@ T_ACQ = "caa_acquisition_client_events_rl"
 
 
 class Caa:
-    def __init__(self, impersonate, lang, waterfall_id=None):
+    def __init__(self, impersonate, lang, waterfall_id=None, ua_headers=None):
         self.fp = impersonate
         self.lang = lang
         self.wid = waterfall_id or str(uuid.uuid4())
         self.sent = 0
+        # 与主流程同一套指纹的 UA 头；不传则沿用旧的 chrome142 默认值
+        self.ua_headers = dict(ua_headers) if ua_headers else None
 
     def _send(self, session, events):
         if not events or session is None:
             return None
         from .client import CHROME142_UA
         h = {
-            **CHROME142_UA,
+            **(self.ua_headers if self.ua_headers is not None else CHROME142_UA),
             "accept": "*/*",
             "content-type": "application/json",
             "origin": BASE,

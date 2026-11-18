@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import random
 import sys
 import threading
 import traceback
@@ -16,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from auth_flow import MuseFlow, MuseFlowError, MuseRegisterResult  # noqa: E402
+from fingerprint import generate_fingerprint  # noqa: E402
 from mail_providers import (  # noqa: E402
     MailProviderError,
     create_mail_provider,
@@ -105,6 +107,27 @@ def _do_register(
 
         auto_pool_own = bool(options.get("auto_pool_own_code", True))
 
+        # 指纹轮换：默认（chrome142 / 空 / auto / random）不再用固定指纹，
+        # 每单现生成一套 Chrome 家族指纹（TLS impersonate / UA / Client Hints /
+        # Accept-Language / 屏幕全部同源，JP 画像），避免同一指纹连续注册被风控关联。
+        # 显式指定了其他 impersonate 的单子保持原样，不强制轮换。
+        fingerprint = None
+        impersonate_opt = (options.get("impersonate") or "chrome142").strip()
+        if impersonate_opt in ("", "chrome142", "auto", "random"):
+            rng = random.Random()
+            for _ in range(20):
+                cand = generate_fingerprint(rng, country_code="JP")
+                if cand.get("browser_type") == "chrome":
+                    fingerprint = cand
+                    break
+            if fingerprint is None:
+                fingerprint = generate_fingerprint(random.Random(), country_code="JP")
+            impersonate_opt = fingerprint["impersonate"]
+            log.info(
+                f"[register] 本单指纹: {fingerprint.get('browser_type')}/{fingerprint['impersonate']} "
+                f"屏幕={fingerprint.get('screen')} 语言={fingerprint.get('lang_full')}"
+            )
+
         def _on_phase(stage: str, info: dict) -> None:
             _emit_status(run_id, "phase", {
                 "phase": stage,
@@ -124,7 +147,8 @@ def _do_register(
 
         flow = MuseFlow(
             proxy=options.get("proxy"),
-            impersonate=options.get("impersonate") or "chrome142",
+            impersonate=impersonate_opt,
+            fingerprint=fingerprint,
             lang=options.get("lang") or "ja",
             otp_timeout=int(options.get("otp_timeout") or 45),
             first_name=options.get("first_name") or "",

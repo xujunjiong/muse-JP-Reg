@@ -151,6 +151,7 @@ class MuseFlow:
         resolve_ip: bool = True,
         redeem_mode: str = "pool",   # "none" | "single" | "pool"
         invite_code: str = "",
+        fingerprint: Optional[dict] = None,
         on_phase: Optional[Callable[[str, dict], None]] = None,
         on_early_save: Optional[Callable[[MuseRegisterResult], None]] = None,
         claim_pool_code: Optional[Callable[[], Optional[str]]] = None,
@@ -158,7 +159,13 @@ class MuseFlow:
         on_own_code: Optional[Callable[[str, str], None]] = None,
     ):
         self.proxy = (proxy or "").strip() or None
-        self.impersonate = (impersonate or "chrome142").strip()
+        # fingerprint 优先：TLS impersonate / UA / Client Hints / 语言 / 屏幕同源。
+        # 不传 fingerprint 时沿用旧行为（固定 impersonate + chrome142 头）。
+        self.fingerprint = dict(fingerprint) if fingerprint else None
+        if self.fingerprint:
+            self.impersonate = (self.fingerprint.get("impersonate") or impersonate or "chrome142").strip()
+        else:
+            self.impersonate = (impersonate or "chrome142").strip()
         self.lang = (lang or "ja").strip()
         self.otp_timeout = max(15, int(otp_timeout or 45))
         self.first_name = (first_name or "").strip() or random.choice(GIVEN_NAMES)
@@ -198,7 +205,14 @@ class MuseFlow:
         try:
             email = mail_provider.create_mailbox()
             self.result.email = email
-            logger.info(f"[0/10] 分配邮箱: {email} (指纹={self.impersonate}, 语言={self.lang})")
+            if self.fingerprint:
+                fp = self.fingerprint
+                logger.info(
+                    f"[0/10] 分配邮箱: {email} (指纹={fp.get('browser_type')}/{self.impersonate}, "
+                    f"UA={fp.get('user_agent')}, 屏幕={fp.get('screen')}, 语言={fp.get('lang_full')})"
+                )
+            else:
+                logger.info(f"[0/10] 分配邮箱: {email} (指纹={self.impersonate}, 语言={self.lang})")
 
             # ── 可选：出口 IP 检测（pre-send 阶段）──
             if self.resolve_ip:
@@ -221,7 +235,8 @@ class MuseFlow:
                 self.result.ip = ip or ""
                 logger.info(f"       出口 IP = {ip or '直连/未知'}")
 
-            client = MuseClient(proxy=self.proxy, impersonate=self.impersonate, lang=self.lang)
+            client = MuseClient(proxy=self.proxy, impersonate=self.impersonate, lang=self.lang,
+                                fingerprint=self.fingerprint)
 
             # ── [1] 打开首页拿初始 Cookie（pre-send 阶段）──
             stage = "bootstrap"
@@ -236,7 +251,7 @@ class MuseFlow:
                         "page_load", "app_root", "hatch_page_load",
                         meta={"surface": "app_load"}, locale=self.lang,
                     ),
-                ])
+                ], ua_headers=client.ua_headers)
 
             # ── [2] 重启注册会话拿 csrf_token（pre-send 阶段）──
             stage = "restart"
@@ -244,7 +259,7 @@ class MuseFlow:
             csrf = client.restart()
             self.result.csrf_token = csrf
             # 传入同一个 waterfall_id，保证 caa 埋点与 native 请求链路完全一致
-            funnel = _caa.Caa(client.fp, client.lang, waterfall_id=getattr(client, "waterfall_id", None)) if self.send_caa else None
+            funnel = _caa.Caa(client.fp, client.lang, waterfall_id=getattr(client, "waterfall_id", None), ua_headers=client.ua_headers) if self.send_caa else None
             if funnel:
                 funnel.page_shown(client.s)
                 time.sleep(random.uniform(1.2, 2.0))
@@ -257,21 +272,47 @@ class MuseFlow:
             stage = "send_otp"
             self._phase(stage, f"[4/10] 发送验证码邮件 -> {email}...")
             sent_at = time.time()
-            client.send_otp(email)
+            resp1 = client.send_otp(email)
+            logger.info(f"       send-otp 响应: {str(resp1)[:200]}")
 
-            # ── [4] 轮询等待 6 位 OTP ──
+            # ── [4] 轮询等待 6 位 OTP（半程无码则重发一次）──
+            # Meta 有时第一次不发信，点一次重发才会发。只重发一次：
+            # 前半程等不到码 -> 调同一 send-otp 接口重发 -> 后半程继续等，
+            # 第二次等待仍用最初的 issued_after=sent_at，迟到的第一封信也算数。
             stage = "wait_otp"
+            first_wait = max(15, self.otp_timeout // 2)
+            second_wait = max(15, self.otp_timeout - first_wait)
             self._phase(stage, f"[5/10] 等待邮箱 6 位验证码 (超时 {self.otp_timeout}s)...")
+            otp_code = None
             try:
                 otp_code = mail_provider.wait_for_otp(
-                    email, timeout=self.otp_timeout, issued_after=sent_at
+                    email, timeout=first_wait, issued_after=sent_at
                 )
-            except TimeoutError as exc:
-                raise MuseFlowError(
-                    f"OTP 等待超时 ({self.otp_timeout}s): {exc}",
-                    stage=stage,
-                    category="otp_timeout",
-                ) from exc
+            except TimeoutError:
+                otp_code = None
+            if not otp_code:
+                logger.info(
+                    f"       前 {first_wait}s 未收到验证码，重发一次验证码..."
+                )
+                stage = "send_otp"
+                self._phase(stage, f"[4/10] 重发验证码邮件 -> {email}...")
+                resp2 = client.send_otp(email)
+                logger.info(f"       重发 send-otp 响应: {str(resp2)[:200]}")
+                stage = "wait_otp"
+                self._phase(
+                    stage,
+                    f"[5/10] 重发后继续等待验证码 (剩余 {second_wait}s)...",
+                )
+                try:
+                    otp_code = mail_provider.wait_for_otp(
+                        email, timeout=second_wait, issued_after=sent_at
+                    )
+                except TimeoutError as exc:
+                    raise MuseFlowError(
+                        f"OTP 等待超时 ({self.otp_timeout}s, 含一次重发): {exc}",
+                        stage=stage,
+                        category="otp_timeout",
+                    ) from exc
             if not otp_code:
                 raise MuseFlowError("未获取到有效 6 位验证码", stage=stage, category="otp_timeout")
             logger.info(f"       收到验证码: {otp_code}")
@@ -354,7 +395,7 @@ class MuseFlow:
                     _falco.interaction(
                         "https://muse.ai/", "page_load", "main_app", "page_load", locale=self.lang
                     ),
-                ])
+                ], ua_headers=client.ua_headers)
 
             # ── [7] 会话引导（auth.meta.com/hatch/session/bootstrap/）──
             stage = "session_bootstrap"

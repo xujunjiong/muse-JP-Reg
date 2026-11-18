@@ -75,7 +75,7 @@ def perf(uri, nav_type="navigate", seconds=None):
             "payload": json.dumps(payload, separators=(",", ":"))}
 
 
-def send(session, impersonate, lang, session_id, events):
+def send(session, impersonate, lang, session_id, events, ua_headers=None):
     """发送一批事件；失败静默"""
     if not events or session is None:
         return None
@@ -83,7 +83,7 @@ def send(session, impersonate, lang, session_id, events):
             "machineId": "not_set", "events": events}
     from .client import CHROME142_UA
     h = {
-        **CHROME142_UA,
+        **(ua_headers if ua_headers is not None else CHROME142_UA),
         "accept": "*/*",
         "content-type": "application/json",
         "origin": BASE,

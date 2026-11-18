@@ -45,6 +45,76 @@ CHROME142_COMMON = {
     "accept-encoding": "gzip, deflate, br, zstd",
 }
 
+
+def fingerprint_headers(fp):
+    """把 fingerprint.py 生成的一套指纹转成 UA 相关请求头。
+
+    只含 UA / Client Hints；Accept-Language 由 MuseClient._h() 按指纹的
+    lang_full 统一补。非 Chromium 家族不发 sec-ch-ua*（真实浏览器行为）。
+    空值字段一律不发，避免出现 `sec-ch-ua: ""` 这种假头。
+    """
+    fp = fp or {}
+    h = {}
+    ua = (fp.get("user_agent") or "").strip()
+    if ua:
+        h["user-agent"] = ua
+    # 头名（连字符）-> 指纹字典键（下划线）的映射
+    key_map = {
+        "sec-ch-ua": "sec_ch_ua",
+        "sec-ch-ua-mobile": "sec_ch_ua_mobile",
+        "sec-ch-ua-platform": "sec_ch_ua_platform",
+        "sec-ch-ua-full-version-list": "sec_ch_ua_full_version_list",
+        "sec-ch-ua-arch": "sec_ch_ua_arch",
+        "sec-ch-ua-bitness": "sec_ch_ua_bitness",
+        "sec-ch-ua-model": "sec_ch_ua_model",
+        "sec-ch-ua-platform-version": "sec_ch_ua_platform_version",
+    }
+    for header, fp_key in key_map.items():
+        val = (fp.get(fp_key) or "").strip()
+        if val:
+            h[header] = val
+    return h
+
+
+def _header_sets(ua_headers):
+    """按 UA 头集生成 JSON / GET / HTML 三套请求头模板（与模块常量同构）。"""
+    json_h = {
+        **ua_headers,
+        "accept": "*/*",
+        "content-type": "application/json",
+        "origin": BASE,
+        "referer": BASE + "/",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
+        "accept-encoding": "gzip, deflate, br, zstd",
+    }
+    get_h = {
+        **ua_headers,
+        "accept": "*/*",
+        "referer": BASE + "/",
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
+        "accept-encoding": "gzip, deflate, br, zstd",
+    }
+    html_h = {
+        "upgrade-insecure-requests": "1",
+        **ua_headers,
+        "accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8,"
+            "application/signed-exchange;v=b3;q=0.7"
+        ),
+        "sec-fetch-site": "none",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-user": "?1",
+        "sec-fetch-dest": "document",
+        "accept-encoding": "gzip, deflate, br, zstd",
+    }
+    return json_h, get_h, html_h
+
+
 HEADERS_JSON = {
     **CHROME142_UA,
     "accept": "*/*",
@@ -177,14 +247,26 @@ class MuseError(RuntimeError):
 class MuseClient:
     """一个账号 = 一个 Session（一个出口 IP）"""
 
-    def __init__(self, proxy=None, impersonate="chrome142", lang="ja", timeout=60):
-        self.fp = impersonate
-        self.lang = "ja,en-US;q=0.9,en;q=0.8" if lang == "ja" else lang
-        self.raw_lang = lang
+    def __init__(self, proxy=None, impersonate="chrome142", lang="ja", timeout=60, fingerprint=None):
+        # fingerprint 优先：TLS impersonate、UA、Client Hints、Accept-Language
+        # 必须来自同一套指纹，否则会出现“TLS 说 Chrome/146、UA 说 142”的自相矛盾。
+        self.fingerprint = dict(fingerprint) if fingerprint else None
+        if self.fingerprint:
+            self.fp = self.fingerprint.get("impersonate") or impersonate
+            self.ua_headers = fingerprint_headers(self.fingerprint)
+            self.lang = self.fingerprint.get("lang_full") or (
+                "ja,en-US;q=0.9,en;q=0.8" if lang == "ja" else lang)
+            self.raw_lang = self.fingerprint.get("lang") or lang
+        else:
+            self.fp = impersonate
+            self.ua_headers = dict(CHROME142_UA)
+            self.lang = "ja,en-US;q=0.9,en;q=0.8" if lang == "ja" else lang
+            self.raw_lang = lang
+        self.headers_json, self.headers_get, self.headers_html = _header_sets(self.ua_headers)
         self.proxy = normalize_proxy(proxy)
         self.timeout = timeout
         raw_session = cr.Session(
-            impersonate=impersonate,
+            impersonate=self.fp,
             default_headers=False,
             proxies={"http": self.proxy, "https": self.proxy} if self.proxy else {"http": "", "https": ""},
             timeout=timeout,
@@ -230,7 +312,7 @@ class MuseClient:
         prev_host = None
         for _ in range(12):
             cur_host = urlsplit(url).hostname
-            hdr = self._h(HEADERS_HTML, {
+            hdr = self._h(self.headers_html, {
                 "sec-fetch-site": _compute_sec_fetch_site(prev_host, cur_host),
             }, priority="u=0, i")
             r = self.s.get(url, impersonate=self.fp, headers=hdr, allow_redirects=False)
@@ -249,15 +331,25 @@ class MuseClient:
                 raise MuseError(f"open-home {r.status_code}: {r.text[:120]}")
             self.home_url = url
             # 模拟真实浏览器 CookieMonster + Facebook Pixel 客户端 Cookie（wd / dpr / _fbp）
-            self.s.cookies.set("wd", "1440x820", domain=".muse.ai", path="/")
-            self.s.cookies.set("dpr", "2", domain=".muse.ai", path="/")
+            # 有指纹时按指纹的屏幕/DPR 取值（视口高 = 屏幕高 - 80，与旧默认值 1440x900->1440x820 同口径）
+            if self.fingerprint:
+                try:
+                    sw, sh = (self.fingerprint.get("screen") or "1920x1080").split("x")
+                    wd = f"{sw}x{int(sh) - 80}"
+                except Exception:
+                    wd = "1920x1000"
+                dpr = str(self.fingerprint.get("device_pixel_ratio") or 1.0)
+            else:
+                wd, dpr = "1440x820", "2"
+            self.s.cookies.set("wd", wd, domain=".muse.ai", path="/")
+            self.s.cookies.set("dpr", dpr, domain=".muse.ai", path="/")
             fbp = f"fb.1.{int(time.time() * 1000)}.{random.randint(10**17, 10**18 - 1)}"
             self.s.cookies.set("_fbp", fbp, domain=".muse.ai", path="/")
             try:
                 self.s.get(
                     BASE + "/api/consent/status",
                     impersonate=self.fp,
-                    headers=self._h(HEADERS_GET, {"referer": url}),
+                    headers=self._h(self.headers_get, {"referer": url}),
                 )
             except Exception:
                 pass
@@ -267,7 +359,7 @@ class MuseClient:
     def restart(self, resume=False):
         """开启注册流程，生成全程共享的 waterfall_id 并返回 csrf_token。"""
         self.waterfall_id = _uuid()
-        init_headers = self._h(HEADERS_JSON, {
+        init_headers = self._h(self.headers_json, {
             "referer": getattr(self, "home_url", BASE + "/"),
             "X-Hatch-Waterfall-Id": self.waterfall_id,
         })
@@ -291,7 +383,7 @@ class MuseClient:
             extra["X-Hatch-CSRF-Token"] = self.csrf
             extra["X-Hatch-Waterfall-Id"] = self.waterfall_id
             extra["X-Hatch-Caa-Reg-Entry-Point"] = "login_home"
-        return self._h(HEADERS_JSON, extra)
+        return self._h(self.headers_json, extra)
 
     def send_otp(self, email, region=None):
         body = {"contact_point": email}
@@ -385,7 +477,7 @@ class MuseClient:
         prev_host = "muse.ai"
         while True:
             cur_host = urlsplit(url).hostname
-            headers = self._h(HEADERS_HTML, {
+            headers = self._h(self.headers_html, {
                 "sec-fetch-site": _compute_sec_fetch_site(prev_host, cur_host),
             })
             if method == "POST":
@@ -440,7 +532,7 @@ class MuseClient:
             "disclosure_version": version,
             "disclosure_text": text,
         }
-        headers = self._h(HEADERS_JSON)
+        headers = self._h(self.headers_json)
         referer = (onboarding or {}).get("source_url")
         if referer:
             headers["referer"] = referer
@@ -460,7 +552,7 @@ class MuseClient:
         return self.s.get(
             BASE + "/api/hatch/invite",
             impersonate=self.fp,
-            headers=self._h(HEADERS_GET),
+            headers=self._h(self.headers_get),
         )
 
     def is_live(self):
@@ -473,7 +565,7 @@ class MuseClient:
         r = self.s.get(
             BASE + "/?aymh_complete=1",
             impersonate=self.fp,
-            headers=self._h(HEADERS_HTML, {"sec-fetch-site": "same-origin", "referer": BASE + "/"}),
+            headers=self._h(self.headers_html, {"sec-fetch-site": "same-origin", "referer": BASE + "/"}),
         )
         m = re.search(r'vmId[\\"]*:[\\"]*([0-9a-fA-F-]{36})', r.text)
         if not m:
@@ -482,7 +574,7 @@ class MuseClient:
         self.s.post(
             BASE + "/api/hatch/vm/wake",
             impersonate=self.fp,
-            headers=self._h(HEADERS_JSON),
+            headers=self._h(self.headers_json),
             data=json.dumps({
                 "vm_id": vm_id,
                 "retry_count": 0,
@@ -498,7 +590,7 @@ class MuseClient:
         return self.s.post(
             BASE + "/api/hatch/stateful-sharing",
             impersonate=self.fp,
-            headers=self._h(HEADERS_JSON),
+            headers=self._h(self.headers_json),
             data="",
         )
 
@@ -508,7 +600,7 @@ class MuseClient:
         r = self.s.post(
             BASE + "/api/hatch/invite-code/redeem",
             impersonate=self.fp,
-            headers=self._h(HEADERS_JSON),
+            headers=self._h(self.headers_json),
             data=json.dumps({"code": code, "supportsRedemptionStatus": True}, separators=(",", ":")),
         )
         if r.status_code == 200 and '"success":true' in r.text:
@@ -520,7 +612,7 @@ class MuseClient:
         r = self.s.post(
             BASE + "/api/hatch/invite",
             impersonate=self.fp,
-            headers=self._h(HEADERS_JSON),
+            headers=self._h(self.headers_json),
             data="",
         )
         if r.status_code != 200:
